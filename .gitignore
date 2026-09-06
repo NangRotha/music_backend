@@ -1,0 +1,32 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# SQLite Database
+*.db
+*.sqlite3
+music_store.db
+*.db-journal
+
+# Uploads directory (do not commit audio/image binaries)
+uploads/*
+!uploads/.gitkeep
+
+# Node dependencies
+node_modules/
+npm-debug.log*
+
+# macOS
+.DS_Store

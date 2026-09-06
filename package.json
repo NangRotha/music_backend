@@ -1,0 +1,12 @@
+{
+  "name": "music-backend",
+  "version": "1.0.0",
+  "description": "FastAPI Backend for KhmerBeats Music Store",
+  "scripts": {
+    "start": "uvicorn main:app --host 0.0.0.0 --port 8000",
+    "dev": "uvicorn main:app --reload --port 8000"
+  },
+  "dependencies": {
+    "uploadthing": "^7.7.4"
+  }
+}
