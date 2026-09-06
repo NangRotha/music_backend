@@ -62,22 +62,51 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for user & admin frontends (configurable via CORS_ORIGINS)
+# ==================== CORS CONFIGURATION ====================
+# Explicitly support localhost:5173 (user) and localhost:5174 (admin) plus environment origins
+base_origins = [
+    "http://localhost:5173",
+    "http://localhost:5173/",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5173/",
+    "http://localhost:5174",
+    "http://localhost:5174/",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:5174/",
+    "http://localhost:3000",
+    "http://localhost:3000/",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3000/",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "https://music-user.vercel.app",
+    "https://music-admin.vercel.app",
+]
+
 cors_origins_env = os.getenv("CORS_ORIGINS", "*").strip()
-if not cors_origins_env or cors_origins_env == "*":
-    origins = ["*"]
-    origin_regex = r"^https?:\/\/.*"
-else:
-    origins = [orig.strip() for orig in cors_origins_env.split(",") if orig.strip()]
-    origin_regex = None
+origins = list(base_origins)
+
+if cors_origins_env and cors_origins_env != "*":
+    for orig in cors_origins_env.split(","):
+        cleaned = orig.strip()
+        if cleaned:
+            if cleaned not in origins:
+                origins.append(cleaned)
+            with_slash = cleaned if cleaned.endswith("/") else f"{cleaned}/"
+            without_slash = cleaned.rstrip("/")
+            if with_slash not in origins:
+                origins.append(with_slash)
+            if without_slash not in origins:
+                origins.append(without_slash)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origin_regex is None else [],
-    allow_origin_regex=origin_regex,
+    allow_origins=origins,
+    allow_origin_regex=r"^https?:\/\/.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Mount uploads directory
