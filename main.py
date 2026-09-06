@@ -541,6 +541,7 @@ def delete_promo(
 
 # ==================== TELEGRAM CHECKOUT & ORDERS ====================
 @app.post("/api/orders/inquiry", response_model=OrderInquiryOut)
+@app.post("/api/orders/inquire", response_model=OrderInquiryOut)
 def create_order_inquiry(payload: OrderInquiryCreate, db: Session = Depends(get_db)):
     music = db.query(Music).filter(Music.id == payload.music_id).first()
     if not music:
