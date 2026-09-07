@@ -12,7 +12,13 @@ except (ImportError, ValueError):
     from models import Admin, Settings, Music, PromoCode, OrderInquiry, AlertPopup, AboutSection, Slide, Category
     from auth import hash_password
 
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+# Uploads live on the Render Persistent Disk when one is mounted (so admin
+# media survives deploys); otherwise they stay in the repo's backend/uploads.
+_RENDER_DISK_PATH = os.getenv("RENDER_DISK_PATH", "").strip()
+if _RENDER_DISK_PATH:
+    UPLOAD_DIR = os.path.join(os.path.abspath(os.path.expanduser(_RENDER_DISK_PATH)), "uploads")
+else:
+    UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def generate_melodic_audio(filepath: str, base_freq: float = 300, duration: int = 15, style: str = "acoustic"):

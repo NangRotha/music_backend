@@ -3,14 +3,24 @@ services:
     name: music-backend
     runtime: docker
     dockerfilePath: Dockerfile
-    plan: free
+    # NOTE: Render Persistent Disks require a paid instance type (Starter or
+    # higher). Free instances cannot mount disks. Change plan here only if you
+    # accept the monthly cost for persistence.
+    plan: starter
     region: singapore
     healthCheckPath: /health
+    # Persistent volume – the SQLite DB + local uploads survive every deploy.
+    disk:
+      name: music-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PORT
         value: 10000
       - key: DATABASE_URL
-        value: sqlite:///./music_store.db
+        value: sqlite:////var/data/music_store.db
+      - key: RENDER_DISK_PATH
+        value: /var/data
       - key: JWT_SECRET_KEY
         generateValue: true
       - key: JWT_ALGORITHM
