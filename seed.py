@@ -72,6 +72,12 @@ def create_default_logo():
         with open(logo_path, "w") as f:
             f.write(svg_content)
 
+def _slugify_name(name: str) -> str:
+    """Mirror of the admin/backend slug generator (ASCII safe)."""
+    s = (name or "").lower().replace(" ", "-").replace("/", "-")
+    allowed = "".join(ch for ch in s if ch.isalnum() or ch == "-")
+    return allowed or "genre"
+
 def seed_database():
     Base.metadata.create_all(bind=engine)
     db: Session = SessionLocal()
@@ -382,6 +388,46 @@ def seed_database():
             if not existing:
                 slide_item = Slide(**s)
                 db.add(slide_item)
+
+        # Flush pending sample tracks so the distinct-genre query below can see
+        # them (the session is configured with autoflush=False).
+        db.flush()
+
+        # 6. Categories — auto-create from existing track genres so the admin
+        # Categories page and the storefront genre mapping are populated out of
+        # the box. Runs only when the categories table is empty, so it never
+        # overwrites or duplicates admin-managed categories on later deploys.
+        if db.query(Category).count() == 0:
+            khmer_genre_names = {
+                "Acoustic / Lo-Fi": "អាគូស្ទិក / ឡូ-ហ្វាយ",
+                "Bass / Trap": "បាស / ត្រេប",
+                "Classic Khmer": "តន្ត្រីខ្មែរបុរាណ",
+                "Hip Hop / Fusion": "ហ៊ីបហប / ហ្វួស្យន់",
+                "Pop / Indie": "ប៉ុប / អ៊ីនឌី",
+                "Synthwave / EDM": "ស៊ីនវេវ / អេឌីអឹម",
+            }
+            genre_rows = db.query(Music.genre).distinct().all()
+            seen = set()
+            order = 1
+            added = 0
+            for row in genre_rows:
+                name = (row[0] or "").strip()
+                if not name or name.lower() in seen or name.lower() == "all":
+                    continue
+                seen.add(name.lower())
+                db.add(Category(
+                    name_en=name,
+                    name_kh=khmer_genre_names.get(name),
+                    slug=_slugify_name(name),
+                    description_en=f"All {name} tracks available in the store.",
+                    description_kh=None,
+                    order_index=order,
+                    is_active=True
+                ))
+                added += 1
+                order += 1
+            if added:
+                print(f"Seeded {added} music categories from track genres")
 
         db.commit()
         print("Database seeded successfully with sample music, about, and slides!")
