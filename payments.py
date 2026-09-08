@@ -11,13 +11,19 @@ import os
 import requests
 
 GATEWAY_BASE = os.getenv("KHQRCC_GATEWAY_URL", "https://khqr.cc").rstrip("/")
-PROFILE_ID = (os.getenv("KHQRCC_PROFILE_ID") or "").strip()
-SECRET_KEY = (os.getenv("KHQRCC_SECRET_KEY") or "").strip()
+
+
+def _profile_id() -> str:
+    return (os.getenv("KHQRCC_PROFILE_ID") or "").strip()
+
+
+def _secret_key() -> str:
+    return (os.getenv("KHQRCC_SECRET_KEY") or "").strip()
 
 
 def is_configured() -> bool:
     """True when the merchant profile + secret are present in the environment."""
-    return bool(PROFILE_ID and SECRET_KEY)
+    return bool(_profile_id() and _secret_key())
 
 
 def _sha1(text: str) -> str:
@@ -25,7 +31,7 @@ def _sha1(text: str) -> str:
 
 
 def _post(path: str, data: dict) -> dict:
-    url = f"{GATEWAY_BASE}/api/{PROFILE_ID}/{path}"
+    url = f"{GATEWAY_BASE}/api/{_profile_id()}/{path}"
     try:
         resp = requests.post(url, data=data, timeout=30)
     except requests.RequestException as exc:
@@ -46,7 +52,7 @@ def create_qr_payment(*, transaction_id: str, amount: float, success_url: str,
         raise RuntimeError("KHQRCC_PROFILE_ID / KHQRCC_SECRET_KEY are not configured")
     amount_str = f"{amount:.2f}"
     # hash = sha1(secret + transaction_id + amount + success_url + remark)
-    payment_hash = _sha1(f"{SECRET_KEY}{transaction_id}{amount_str}{success_url}{remark}")
+    payment_hash = _sha1(f"{_secret_key()}{transaction_id}{amount_str}{success_url}{remark}")
 
     payload = {
         "transaction_id": transaction_id,
@@ -82,7 +88,7 @@ def check_payment(transaction_id: str) -> dict:
       {"status": "pending", ...}
       {"status": "error", "message": ...}
     """
-    payment_hash = _sha1(f"{SECRET_KEY}{transaction_id}")
+    payment_hash = _sha1(f"{_secret_key()}{transaction_id}")
     result = _post(
         "payment-gateway/v1/payments/check-transv2-khqrcc",
         {"transaction_id": transaction_id, "hash": payment_hash},

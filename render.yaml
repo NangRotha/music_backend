@@ -39,3 +39,9 @@ services:
         sync: false
       - key: UPLOADTHING_APP_ID
         sync: false
+      - key: KHQRCC_PROFILE_ID
+        sync: false
+      - key: KHQRCC_SECRET_KEY
+        sync: false
+      - key: KHQRCC_GATEWAY_URL
+        value: "https://khqr.cc"
