@@ -953,7 +953,7 @@ def aba_download_music(
     if not file_url:
         raise HTTPException(status_code=404, detail="No audio file available for this track")
 
-    parsed = urlparse(file_url)
+    parsed = urllib.parse.urlparse(file_url)
     base_name = urllib.parse.unquote(os.path.basename(parsed.path)) or f"track-{payment.music_id}"
     safe_name = _safe_download_name(base_name)
 
