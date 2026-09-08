@@ -928,9 +928,8 @@ def _safe_download_name(filename: str) -> str:
     return safe or "track"
 
 
-# Extension helpers so buyers always receive a file with a correct, playable name
-# even when the source CDN URL (e.g. UploadThing) has no file extension.
-_KNOWN_AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".flac", ".webm", ".mp4", ".aiff", ".aif", ".wma", ".amr", ".3gp", ".m4r"}
+# Extension helpers so buyers always receive a file with a correct, playable name,
+# whatever file type the seller hosts (mp3/wav/flac/m4a/ogg/opus/…).
 _AUDIO_EXT_BY_MIME = {
     "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mpeg3": ".mp3", "audio/x-mpeg": ".mp3",
     "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
@@ -938,22 +937,58 @@ _AUDIO_EXT_BY_MIME = {
     "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/mpegurl": ".m3u8", "audio/x-mpegurl": ".m3u8",
     "audio/aac": ".aac", "audio/aacp": ".aac", "audio/flac": ".flac", "audio/x-flac": ".flac",
     "audio/webm": ".webm", "video/webm": ".webm", "audio/vnd.wave": ".wav",
+    "audio/x-ms-wma": ".wma", "audio/x-aiff": ".aiff", "audio/basic": ".au", "audio/x-pn-realaudio": ".ra",
 }
+_BAD_DL_EXTS = {".html", ".htm", ".php", ".aspx", ".asp", ".jsp", ".cfm", ".txt", ".json", ".xml", ".tmp", ".cgi", ".do"}
 
 
-def _audio_download_filename(base_name: str, content_type: str) -> str:
-    """Picks a safe download name, appending the right audio extension when the
-    original URL's extension is missing or not an audio extension."""
+def _sniff_audio_ext(prefix: bytes) -> str:
+    """Detects the file type from its magic bytes when the URL/CDN gives no hint."""
+    if not prefix:
+        return ""
+    if prefix.startswith(b"ID3"):
+        return ".mp3"
+    if len(prefix) >= 2 and prefix[0] == 0xFF and (prefix[1] & 0xE0) == 0xE0:
+        return ".mp3"  # MPEG audio frame sync
+    if prefix.startswith(b"RIFF"):
+        return ".wav" if prefix[8:12] == b"WAVE" else ".avi"
+    if prefix.startswith(b"fLaC"):
+        return ".flac"
+    if prefix.startswith(b"OggS"):
+        return ".ogg"
+    if prefix.startswith(b"\x1A\x45\xDF\xA3"):
+        return ".mka"  # Matroska (MKV/MKA) container
+    if prefix.startswith(b"FORM") and prefix[8:12] == b"AIFF":
+        return ".aiff"
+    if len(prefix) >= 16 and prefix[4:8] == b"ftyp":
+        brand = prefix[8:16]
+        return ".m4a" if (brand[:4] in (b"M4A ", b"M4B ", b"isom") and b"M4A" in brand) else ".mp4"
+    if prefix.startswith(b"#!AMR"):
+        return ".amr"
+    if prefix.startswith(b"MAC "):
+        return ".ape"
+    if prefix.startswith(b"wvpk"):
+        return ".wv"
+    return ""
+
+
+def _audio_download_filename(base_name: str, content_type: str, prefix: bytes = b"") -> str:
+    """Picks a safe download name with the correct extension for ANY file type.
+
+    Priority: (1) real extension present in the URL, (2) extension from the
+    server's Content-Type, (3) sniffed from the file's magic bytes.
+    """
     cleaned = _safe_download_name(base_name)
     ext = os.path.splitext(cleaned)[1].lower()
-    if ext not in _KNOWN_AUDIO_EXTS:
-        mime = (content_type or "").split(";")[0].strip().lower()
-        mapped = _AUDIO_EXT_BY_MIME.get(mime, "")
-        if mapped:
-            if ext:  # drop a misleading extension before appending the real one
-                cleaned = cleaned[: -len(ext)]
-            cleaned += mapped
-    return cleaned
+    if ext and ext not in _BAD_DL_EXTS:
+        return cleaned  # URL already had a real file extension -> keep it as-is
+    if ext:  # drop a misleading extension (e.g. .html) before picking the real one
+        cleaned = cleaned[: -len(ext)].rstrip(".-")
+    mime = (content_type or "").split(";")[0].strip().lower()
+    chosen = _AUDIO_EXT_BY_MIME.get(mime, "") or _sniff_audio_ext(prefix)
+    if chosen:
+        cleaned = (cleaned.rstrip(".-") or "track") + chosen
+    return cleaned or "track"
 
 
 @app.get("/api/payments/download/{transaction_id}")
@@ -1020,9 +1055,21 @@ def aba_download_music(
             detail="The track URL returned an HTML page instead of an audio file — check the track's audio link in Admin.",
         )
     media_type = raw_type or upstream.headers.get("content-type") or "application/octet-stream"
-    download_name = _audio_download_filename(base_name, media_type)
+
+    # Read the first chunk before responding so we can sniff the file type and
+    # still return clean error messages (can't raise after streaming has begun).
+    prefix = b""
+    try:
+        prefix = next(upstream.iter_content(chunk_size=65536), b"")
+    except Exception as exc:
+        upstream.close()
+        raise HTTPException(status_code=502, detail=f"Could not read the track file: {exc}")
+
+    download_name = _audio_download_filename(base_name, media_type, prefix)
 
     def _stream():
+        if prefix:
+            yield prefix
         for chunk in upstream.iter_content(chunk_size=65536):
             if chunk:
                 yield chunk
