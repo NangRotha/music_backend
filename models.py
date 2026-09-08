@@ -88,6 +88,32 @@ class OrderInquiry(Base):
     telegram_url = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transaction_id = Column(String(80), unique=True, nullable=False, index=True)
+    order_id = Column(Integer, ForeignKey("order_inquiries.id", ondelete="SET NULL"), nullable=True)
+    music_id = Column(Integer, ForeignKey("music.id", ondelete="SET NULL"), nullable=True)
+    music_title = Column(String(200), nullable=False)
+    music_artist = Column(String(150), default="")
+    original_price = Column(Float, default=0.0)
+    track_discount = Column(Float, default=0.0)
+    promo_code = Column(String(50), nullable=True)
+    promo_discount = Column(Float, default=0.0)
+    promo_consumed = Column(Boolean, default=False) # Promo usage counted only once, on success
+    amount = Column(Float, nullable=False)
+    currency = Column(String(10), default="USD")
+    gateway_status = Column(String(30), default="pending") # pending | paid | failed
+    qr_url = Column(String(500), default="")
+    qr_data = Column(Text, default="")
+    customer_name = Column(String(100), default="")
+    customer_phone = Column(String(50), default="")
+    remark = Column(String(255), default="")
+    error = Column(String(255), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    paid_at = Column(DateTime, nullable=True)
+
 class AlertPopup(Base):
     __tablename__ = "alert_popups"
 

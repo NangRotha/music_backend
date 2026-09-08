@@ -1,8 +1,11 @@
 import os
 import sys
+from urllib.parse import parse_qs, urlparse
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Load .env from backend folder and workspace root if present
@@ -54,8 +57,66 @@ elif db_url_env == "sqlite:///music_store.db" or db_url_env in REPO_LOCAL_SQLITE
 else:
     DATABASE_URL = db_url_env
 
-# Engine configuration: conditional connect_args for SQLite vs pool pre-ping for PostgreSQL
-if DATABASE_URL.startswith("sqlite"):
+# ==================== Turso (hosted SQLite) support ====================
+# Turso (https://app.turso.tech) hosts a SQLite-compatible database so the app
+# can run on Render's FREE plan without a paid Persistent Disk. The stock
+# SQLAlchemy sqlite:// driver can only open a *local file*, which is why
+# pointing it straight at a Turso URL fails - Turso needs its own libSQL
+# driver + dialect (see requirements: sqlalchemy-libsql).
+#
+# Enable Turso by setting:
+#   TURSO_DATABASE_URL = libsql://<database>-<organization>.turso.io
+#                        (newer Turso consoles may show a "turso://" scheme -
+#                         only the host name matters here, so both work)
+#   TURSO_AUTH_TOKEN   = the database auth token from the Turso dashboard
+# For convenience a DATABASE_URL that already starts with libsql:// or
+# turso:// also activates Turso mode (an optional ?authToken=... query
+# parameter in that URL is honoured as well).
+turso_url_raw = (os.getenv("TURSO_DATABASE_URL") or "").strip()
+if not turso_url_raw and db_url_env.startswith(("libsql://", "turso://")):
+    turso_url_raw = db_url_env
+TURSO_ACTIVE = bool(turso_url_raw)
+turso_auth_token = ""
+
+if TURSO_ACTIVE:
+    _parsed = urlparse(turso_url_raw)
+    _turso_host = (_parsed.netloc or _parsed.path).split("@")[-1]  # drop userinfo
+    if not _turso_host:
+        raise RuntimeError(
+            f"Invalid TURSO_DATABASE_URL '{turso_url_raw}' - expected "
+            "libsql://<db>-<org>.turso.io (or turso://<db>-<org>.turso.io)."
+        )
+    _query_params = parse_qs(_parsed.query)
+    _token_from_url = (_query_params.get("authToken") or _query_params.get("auth_token") or [""])[0].strip()
+    turso_auth_token = (os.getenv("TURSO_AUTH_TOKEN") or "").strip() or _token_from_url
+    if not turso_auth_token:
+        raise RuntimeError(
+            "Turso is configured but no auth token was found. Set the "
+            "TURSO_AUTH_TOKEN environment variable (or append "
+            "?authToken=... to the Turso URL)."
+        )
+    # sqlalchemy-libsql registers the "sqlite+libsql" dialect for remote Turso.
+    DATABASE_URL = f"sqlite+libsql://{_turso_host}?secure=true"
+
+# ==================== Engine configuration ====================
+# Local SQLite file  -> check_same_thread disabled (FastAPI threadpool).
+# Turso (remote)     -> libSQL dialect + NullPool (don't pin a connection to a thread).
+# PostgreSQL / MySQL -> pool_pre_ping so idle connections don't drop.
+if TURSO_ACTIVE:
+    try:
+        import sqlalchemy_libsql  # noqa: F401  -- registers the "sqlite+libsql" dialect
+    except ImportError as exc:
+        raise RuntimeError(
+            "TURSO_DATABASE_URL is set but the 'sqlalchemy-libsql' driver is not "
+            "installed. Run: pip install 'sqlalchemy-libsql>=0.2.0' "
+            "(requires Python <= 3.13; the project Docker image uses Python 3.11)."
+        ) from exc
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"auth_token": turso_auth_token},
+        poolclass=NullPool,  # remote DB: each connection is independent
+    )
+elif DATABASE_URL.startswith("sqlite"):
     engine = create_engine(
         DATABASE_URL,
         connect_args={"check_same_thread": False}

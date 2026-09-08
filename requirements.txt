@@ -11,3 +11,7 @@ bcrypt>=4.0.1
 aiofiles>=23.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
+# Turso hosted-SQLite SQLAlchemy driver. Only supports Python <= 3.13
+# (the Render Docker image uses 3.11, so it installs there; skipped on local
+# Python 3.14). Needed only when using TURSO_DATABASE_URL / TURSO_AUTH_TOKEN.
+sqlalchemy-libsql>=0.2.0; python_version < "3.14"

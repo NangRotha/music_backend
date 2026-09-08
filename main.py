@@ -2,7 +2,7 @@ import os
 import sys
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 import shutil
 
@@ -14,14 +14,15 @@ PARENT_DIR = os.path.dirname(CURRENT_DIR)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 try:
     from .database import engine, Base, get_db
-    from .models import Admin, Settings, Music, PromoCode, OrderInquiry, AlertPopup, AboutSection, Slide, Category
+    from .models import Admin, Settings, Music, PromoCode, OrderInquiry, Payment, AlertPopup, AboutSection, Slide, Category
     from .schemas import (
         AdminLogin, AdminChangeCredentials, AdminOut, TokenResponse,
         SettingsOut, SettingsUpdate,
@@ -29,6 +30,8 @@ try:
         PromoCodeOut, PromoCodeCreate, PromoCodeUpdate,
         PromoValidateRequest, PromoValidateResponse,
         OrderInquiryCreate, OrderInquiryOut,
+        PaymentCheckoutRequest, PaymentCheckoutResponse,
+        PaymentStatusRequest, PaymentStatusResponse,
         AlertPopupOut, AlertPopupCreate, AlertPopupUpdate,
         AboutSectionOut, AboutSectionCreate, AboutSectionUpdate,
         SlideOut, SlideCreate, SlideUpdate,
@@ -37,9 +40,10 @@ try:
     from .auth import hash_password, verify_password, create_access_token, get_current_admin
     from .seed import seed_database, UPLOAD_DIR
     from .uploadthing_client import upload_file_to_uploadthing
+    from . import payments as khqrcc
 except (ImportError, ValueError):
     from database import engine, Base, get_db
-    from models import Admin, Settings, Music, PromoCode, OrderInquiry, AlertPopup, AboutSection, Slide, Category
+    from models import Admin, Settings, Music, PromoCode, OrderInquiry, Payment, AlertPopup, AboutSection, Slide, Category
     from schemas import (
         AdminLogin, AdminChangeCredentials, AdminOut, TokenResponse,
         SettingsOut, SettingsUpdate,
@@ -47,6 +51,8 @@ except (ImportError, ValueError):
         PromoCodeOut, PromoCodeCreate, PromoCodeUpdate,
         PromoValidateRequest, PromoValidateResponse,
         OrderInquiryCreate, OrderInquiryOut,
+        PaymentCheckoutRequest, PaymentCheckoutResponse,
+        PaymentStatusRequest, PaymentStatusResponse,
         AlertPopupOut, AlertPopupCreate, AlertPopupUpdate,
         AboutSectionOut, AboutSectionCreate, AboutSectionUpdate,
         SlideOut, SlideCreate, SlideUpdate,
@@ -55,6 +61,7 @@ except (ImportError, ValueError):
     from auth import hash_password, verify_password, create_access_token, get_current_admin
     from seed import seed_database, UPLOAD_DIR
     from uploadthing_client import upload_file_to_uploadthing
+    import payments as khqrcc
 
 app = FastAPI(
     title="KhmerBeats Music Store API",
@@ -679,6 +686,305 @@ def delete_order(
     db.delete(order)
     db.commit()
     return {"message": "Order deleted successfully"}
+
+# ==================== ABA QR AUTO-PAYMENT (KHQRcc) ====================
+def _resolve_checkout_pricing(db: Session, music, promo_code: Optional[str]) -> dict:
+    """Computes the final price exactly like the Telegram checkout does, but
+    without consuming the promo code (it is consumed only after payment)."""
+    original_price = music.price or 0.0
+    track_discount_pct = music.discount_percent or 0.0
+    track_discount_amt = round(original_price * (track_discount_pct / 100.0), 2)
+    after_track_price = round(original_price - track_discount_amt, 2)
+
+    promo_used = None
+    promo_discount_amt = 0.0
+    if promo_code and promo_code.strip():
+        code_str = promo_code.strip().upper()
+        promo = db.query(PromoCode).filter(PromoCode.code == code_str, PromoCode.is_active == True).first()
+        if not promo:
+            raise HTTPException(status_code=400, detail="Invalid or inactive promo code / កូដបញ្ចុះតម្លៃមិនត្រឹមត្រូវ ឬត្រូវបានបិទ")
+        if promo.expires_at and promo.expires_at < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Promo code has expired / កូដបញ្ចុះតម្លៃនេះផុតកំណត់ហើយ")
+        if promo.usage_limit and promo.used_count >= promo.usage_limit:
+            raise HTTPException(status_code=400, detail="Promo code usage limit reached / កូដបញ្ចុះតម្លៃនេះបានប្រើអស់កំណត់ហើយ")
+        if after_track_price < promo.min_spend:
+            raise HTTPException(status_code=400, detail=f"Minimum spend of ${promo.min_spend:.2f} required / ទាមទារការទិញចាប់ពី ${promo.min_spend:.2f} ឡើងទៅ")
+        promo_used = code_str
+        if promo.discount_type == "percent":
+            promo_discount_amt = after_track_price * (promo.discount_value / 100.0)
+            if promo.max_discount and promo_discount_amt > promo.max_discount:
+                promo_discount_amt = promo.max_discount
+        else:
+            promo_discount_amt = min(after_track_price, promo.discount_value)
+        promo_discount_amt = round(promo_discount_amt, 2)
+
+    final_price = max(0.0, round(after_track_price - promo_discount_amt, 2))
+    return {
+        "original_price": original_price,
+        "track_discount_pct": track_discount_pct,
+        "track_discount_amt": track_discount_amt,
+        "promo_code": promo_used,
+        "promo_discount_amt": promo_discount_amt,
+        "final_price": final_price,
+    }
+
+
+def _make_download_token(transaction_id: str, music_id: int) -> str:
+    return create_access_token(
+        data={"type": "music_download", "transaction_id": transaction_id, "music_id": music_id},
+        expires_delta=timedelta(hours=48),
+    )
+
+
+def _mark_payment_paid(db: Session, payment, music_id: int) -> None:
+    """Idempotently flips a payment to 'paid' and consumes the promo code once."""
+    if payment.gateway_status == "paid":
+        return
+    payment.gateway_status = "paid"
+    payment.paid_at = datetime.utcnow()
+    if payment.promo_code and not payment.promo_consumed:
+        promo = db.query(PromoCode).filter(PromoCode.code == payment.promo_code).first()
+        if promo:
+            promo.used_count += 1
+            payment.promo_consumed = True
+    if payment.order_id:
+        order = db.query(OrderInquiry).filter(OrderInquiry.id == payment.order_id).first()
+        if order:
+            order.status = "confirmed"
+    db.commit()
+
+@app.post("/api/payments/checkout", response_model=PaymentCheckoutResponse)
+def aba_payment_checkout(payload: PaymentCheckoutRequest, request: Request, db: Session = Depends(get_db)):
+    """Creates an ABA QR payment (Direct QR API) for one track and returns the QR
+    image URL. The storefront renders the QR, the customer scans it with ABA Mobile,
+    and the storefront polls /api/payments/status until it returns 'paid'."""
+    if not khqrcc.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="ABA payment is not configured yet. Set KHQRCC_PROFILE_ID and KHQRCC_SECRET_KEY / មិនទាន់កំណត់រចនាសម្ព័ន្ធ ABA នៅឡើយទេ",
+        )
+
+    music = db.query(Music).filter(Music.id == payload.music_id).first()
+    if not music:
+        raise HTTPException(status_code=404, detail="Music not found")
+
+    pricing = _resolve_checkout_pricing(db, music, payload.promo_code)
+    final_price = pricing["final_price"]
+    if final_price < 0.01:
+        raise HTTPException(status_code=400, detail="Amount too small for QR payment / ចំនួនទឹកប្រាក់តូចពេក")
+
+    # Order + payment records kept in sync so the Admin orders log sees them too.
+    ref_code = f"MK-{uuid.uuid4().hex[:6].upper()}"
+    order = OrderInquiry(
+        reference_code=ref_code,
+        music_id=music.id,
+        music_title=music.title_en,
+        music_artist=music.artist_en,
+        original_price=pricing["original_price"],
+        track_discount=pricing["track_discount_amt"],
+        promo_code=pricing["promo_code"],
+        promo_discount=pricing["promo_discount_amt"],
+        final_price=final_price,
+        customer_name=payload.customer_name or "",
+        customer_phone=payload.customer_phone or "",
+        status="initiated",
+        telegram_url="",  # ABA payments do not need the Telegram chat
+    )
+    db.add(order)
+    db.flush()  # get order.id without committing yet
+
+    transaction_id = f"KHB-{uuid.uuid4().hex[:12].upper()}"
+    remark = f"KhmerBeats order {ref_code} - {music.title_en}"
+    payment = Payment(
+        transaction_id=transaction_id,
+        order_id=order.id,
+        music_id=music.id,
+        music_title=music.title_en,
+        music_artist=music.artist_en,
+        original_price=pricing["original_price"],
+        track_discount=pricing["track_discount_amt"],
+        promo_code=pricing["promo_code"],
+        promo_discount=pricing["promo_discount_amt"],
+        amount=final_price,
+        currency="USD",
+        gateway_status="pending",
+        customer_name=payload.customer_name or "",
+        customer_phone=payload.customer_phone or "",
+        remark=remark,
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+
+    # success_url: where the gateway sends the customer after a successful scan.
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    if not origin:
+        origin = str(request.base_url).rstrip("/")
+    success_url = f"{origin}/?payment=success&tx={transaction_id}"
+
+    try:
+        qr_result = khqrcc.create_qr_payment(
+            transaction_id=transaction_id,
+            amount=final_price,
+            success_url=success_url,
+            remark=remark,
+        )
+        payment.qr_url = qr_result.get("qr_url", "")
+        payment.qr_data = qr_result.get("qr", "")
+        db.commit()
+    except Exception as exc:
+        payment.error = str(exc)[:255]
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"ABA payment could not be started: {exc}")
+
+    return PaymentCheckoutResponse(
+        transaction_id=transaction_id,
+        reference_code=ref_code,
+        music_id=music.id,
+        music_title=music.title_en,
+        music_artist=music.artist_en,
+        amount=final_price,
+        currency="USD",
+        qr_url=payment.qr_url,
+        gateway_configured=True,
+    )
+
+@app.post("/api/payments/status", response_model=PaymentStatusResponse)
+def aba_payment_status(payload: PaymentStatusRequest, db: Session = Depends(get_db)):
+    """Polled by the storefront every ~3s after the QR is shown. When the gateway
+    confirms the payment this endpoint flips the order to paid and hands back a
+    signed, time-limited download URL for the purchased track."""
+    payment = db.query(Payment).filter(Payment.transaction_id == payload.transaction_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    if payment.gateway_status == "paid":
+        token = _make_download_token(payment.transaction_id, payment.music_id or 0)
+        return PaymentStatusResponse(
+            transaction_id=payment.transaction_id,
+            status="paid",
+            amount=payment.amount,
+            music_title=payment.music_title,
+            download_token=token,
+            download_url=f"/api/payments/download/{payment.transaction_id}?token={token}",
+        )
+
+    try:
+        result = khqrcc.check_payment(payment.transaction_id)
+    except Exception as exc:
+        return PaymentStatusResponse(
+            transaction_id=payment.transaction_id,
+            status="pending",
+            message=f"Check failed: {exc}",
+        )
+
+    status_now = result.get("status", "pending")
+
+    if status_now == "success":
+        _mark_payment_paid(db, payment, payment.music_id or 0)
+        token = _make_download_token(payment.transaction_id, payment.music_id or 0)
+        return PaymentStatusResponse(
+            transaction_id=payment.transaction_id,
+            status="paid",
+            amount=payment.amount,
+            music_title=payment.music_title,
+            download_token=token,
+            download_url=f"/api/payments/download/{payment.transaction_id}?token={token}",
+        )
+
+    if status_now == "error":
+        payment.gateway_status = "failed"
+        payment.error = (result.get("message") or "Verification failed")[:255]
+        db.commit()
+        return PaymentStatusResponse(
+            transaction_id=payment.transaction_id,
+            status="failed",
+            amount=payment.amount,
+            music_title=payment.music_title,
+            message=result.get("message"),
+        )
+
+    # still pending -> keep polling
+    return PaymentStatusResponse(
+        transaction_id=payment.transaction_id,
+        status="pending",
+        amount=payment.amount,
+        music_title=payment.music_title,
+    )
+
+def _safe_download_name(filename: str) -> str:
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "-" for ch in filename).strip(".-")
+    return safe or "track"
+
+
+@app.get("/api/payments/download/{transaction_id}")
+def aba_download_music(
+    transaction_id: str,
+    token: str = Query(...),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """Serves the purchased track as an attachment. Only works after the ABA
+    payment is confirmed and with the signed token returned by /api/payments/status."""
+    payment = db.query(Payment).filter(Payment.transaction_id == transaction_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if payment.gateway_status != "paid":
+        raise HTTPException(status_code=402, detail="Payment not completed")
+
+    import jwt as _jwt
+    try:
+        payload = _jwt.decode(
+            token,
+            os.getenv("JWT_SECRET_KEY", "super_secret_music_store_jwt_key_2026_khmer_melody_32bytes_long"),
+            algorithms=[os.getenv("JWT_ALGORITHM", "HS256")],
+        )
+    except Exception:
+        raise HTTPException(status_code=403, detail="Invalid or expired download token")
+    if (
+        payload.get("type") != "music_download"
+        or payload.get("transaction_id") != transaction_id
+        or payload.get("music_id") != payment.music_id
+    ):
+        raise HTTPException(status_code=403, detail="Invalid download token")
+
+    music = db.query(Music).filter(Music.id == payment.music_id).first()
+    file_url = (music.preview_audio_url if music else "").strip()
+    if not file_url:
+        raise HTTPException(status_code=404, detail="No audio file available for this track")
+
+    parsed = urlparse(file_url)
+    base_name = urllib.parse.unquote(os.path.basename(parsed.path)) or f"track-{payment.music_id}"
+    safe_name = _safe_download_name(base_name)
+
+    if file_url.startswith("/"):
+        # Local file stored by the backend (uploads dir)
+        local_file = os.path.join(UPLOAD_DIR, os.path.basename(parsed.path))
+        if os.path.isfile(local_file):
+            import mimetypes
+            media_type = mimetypes.guess_type(local_file)[0] or "application/octet-stream"
+            return FileResponse(local_file, media_type=media_type, filename=safe_name)
+        file_url = str(request.base_url).rstrip("/") + file_url
+
+    # Remote CDN file (UploadThing etc.) -> stream it through the API as an attachment
+    try:
+        upstream = requests.get(file_url, stream=True, timeout=60)
+        upstream.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch the track file: {exc}")
+
+    media_type = upstream.headers.get("content-type") or "application/octet-stream"
+
+    def _stream():
+        for chunk in upstream.iter_content(chunk_size=65536):
+            if chunk:
+                yield chunk
+
+    return StreamingResponse(
+        _stream(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
 
 # ==================== FILE UPLOADS (UPLOADTHING CDN) ====================
 @app.get("/api/uploadthing/status")

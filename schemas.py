@@ -179,6 +179,39 @@ class OrderInquiryOut(BaseModel):
     class Config:
         from_attributes = True
 
+# ABA Pay (KHQRcc) QR payment
+class PaymentCheckoutRequest(BaseModel):
+    music_id: int
+    promo_code: Optional[str] = None
+    customer_name: Optional[str] = ""
+    customer_phone: Optional[str] = ""
+
+class PaymentCheckoutResponse(BaseModel):
+    transaction_id: str
+    reference_code: str
+    music_id: int
+    music_title: str
+    music_artist: str
+    amount: float
+    currency: str = "USD"
+    qr_url: str = ""
+    gateway_configured: bool = True
+
+class PaymentStatusRequest(BaseModel):
+    transaction_id: str
+
+class PaymentStatusResponse(BaseModel):
+    transaction_id: str
+    status: str  # pending | paid | failed
+    amount: Optional[float] = None
+    music_title: Optional[str] = None
+    download_token: Optional[str] = None
+    download_url: Optional[str] = None
+    message: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
 # Alert Popup Schemas
 class AlertPopupBase(BaseModel):
     title_en: str
