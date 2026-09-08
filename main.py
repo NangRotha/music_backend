@@ -928,6 +928,34 @@ def _safe_download_name(filename: str) -> str:
     return safe or "track"
 
 
+# Extension helpers so buyers always receive a file with a correct, playable name
+# even when the source CDN URL (e.g. UploadThing) has no file extension.
+_KNOWN_AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".flac", ".webm", ".mp4", ".aiff", ".aif", ".wma", ".amr", ".3gp", ".m4r"}
+_AUDIO_EXT_BY_MIME = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mpeg3": ".mp3", "audio/x-mpeg": ".mp3",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/ogg": ".ogg", "audio/x-ogg": ".ogg", "application/ogg": ".ogg", "audio/opus": ".opus",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/mpegurl": ".m3u8", "audio/x-mpegurl": ".m3u8",
+    "audio/aac": ".aac", "audio/aacp": ".aac", "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "audio/webm": ".webm", "video/webm": ".webm", "audio/vnd.wave": ".wav",
+}
+
+
+def _audio_download_filename(base_name: str, content_type: str) -> str:
+    """Picks a safe download name, appending the right audio extension when the
+    original URL's extension is missing or not an audio extension."""
+    cleaned = _safe_download_name(base_name)
+    ext = os.path.splitext(cleaned)[1].lower()
+    if ext not in _KNOWN_AUDIO_EXTS:
+        mime = (content_type or "").split(";")[0].strip().lower()
+        mapped = _AUDIO_EXT_BY_MIME.get(mime, "")
+        if mapped:
+            if ext:  # drop a misleading extension before appending the real one
+                cleaned = cleaned[: -len(ext)]
+            cleaned += mapped
+    return cleaned
+
+
 @app.get("/api/payments/download/{transaction_id}")
 def aba_download_music(
     transaction_id: str,
@@ -966,7 +994,7 @@ def aba_download_music(
 
     parsed = urllib.parse.urlparse(file_url)
     base_name = urllib.parse.unquote(os.path.basename(parsed.path)) or f"track-{payment.music_id}"
-    safe_name = _safe_download_name(base_name)
+    download_name = _safe_download_name(base_name)
 
     if file_url.startswith("/"):
         # Local file stored by the backend (uploads dir)
@@ -974,7 +1002,7 @@ def aba_download_music(
         if os.path.isfile(local_file):
             import mimetypes
             media_type = mimetypes.guess_type(local_file)[0] or "application/octet-stream"
-            return FileResponse(local_file, media_type=media_type, filename=safe_name)
+            return FileResponse(local_file, media_type=media_type, filename=download_name)
         file_url = str(request.base_url).rstrip("/") + file_url
 
     # Remote CDN file (UploadThing etc.) -> stream it through the API as an attachment
@@ -984,7 +1012,15 @@ def aba_download_music(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not fetch the track file: {exc}")
 
-    media_type = upstream.headers.get("content-type") or "application/octet-stream"
+    raw_type = (upstream.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if raw_type.startswith("text/") or "html" in raw_type:
+        upstream.close()
+        raise HTTPException(
+            status_code=502,
+            detail="The track URL returned an HTML page instead of an audio file — check the track's audio link in Admin.",
+        )
+    media_type = raw_type or upstream.headers.get("content-type") or "application/octet-stream"
+    download_name = _audio_download_filename(base_name, media_type)
 
     def _stream():
         for chunk in upstream.iter_content(chunk_size=65536):
@@ -994,7 +1030,7 @@ def aba_download_music(
     return StreamingResponse(
         _stream(),
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
 
 @app.get("/api/payments/invoice/{transaction_id}")
