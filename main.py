@@ -17,7 +17,7 @@ if PARENT_DIR not in sys.path:
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
 
 try:
@@ -736,6 +736,14 @@ def _make_download_token(transaction_id: str, music_id: int) -> str:
     )
 
 
+def _payment_success_links(payment):
+    """Returns (download_token, download_url, invoice_url) for a paid payment."""
+    token = _make_download_token(payment.transaction_id, payment.music_id or 0)
+    download_url = f"/api/payments/download/{payment.transaction_id}?token={token}"
+    invoice_url = f"/api/payments/invoice/{payment.transaction_id}?token={token}"
+    return token, download_url, invoice_url
+
+
 def _mark_payment_paid(db: Session, payment, music_id: int) -> None:
     """Idempotently flips a payment to 'paid' and consumes the promo code once."""
     if payment.gateway_status == "paid":
@@ -859,14 +867,15 @@ def aba_payment_status(payload: PaymentStatusRequest, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Payment not found")
 
     if payment.gateway_status == "paid":
-        token = _make_download_token(payment.transaction_id, payment.music_id or 0)
+        token, download_url, invoice_url = _payment_success_links(payment)
         return PaymentStatusResponse(
             transaction_id=payment.transaction_id,
             status="paid",
             amount=payment.amount,
             music_title=payment.music_title,
             download_token=token,
-            download_url=f"/api/payments/download/{payment.transaction_id}?token={token}",
+            download_url=download_url,
+            invoice_url=invoice_url,
         )
 
     try:
@@ -882,14 +891,15 @@ def aba_payment_status(payload: PaymentStatusRequest, db: Session = Depends(get_
 
     if status_now == "success":
         _mark_payment_paid(db, payment, payment.music_id or 0)
-        token = _make_download_token(payment.transaction_id, payment.music_id or 0)
+        token, download_url, invoice_url = _payment_success_links(payment)
         return PaymentStatusResponse(
             transaction_id=payment.transaction_id,
             status="paid",
             amount=payment.amount,
             music_title=payment.music_title,
             download_token=token,
-            download_url=f"/api/payments/download/{payment.transaction_id}?token={token}",
+            download_url=download_url,
+            invoice_url=invoice_url,
         )
 
     if status_now == "error":
@@ -984,6 +994,76 @@ def aba_download_music(
         _stream(),
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+@app.get("/api/payments/invoice/{transaction_id}")
+def aba_download_invoice(
+    transaction_id: str,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Returns a PDF invoice for a paid ABA order (gated by the same signed token
+    the storefront receives with the download link)."""
+    payment = db.query(Payment).filter(Payment.transaction_id == transaction_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if payment.gateway_status != "paid":
+        raise HTTPException(status_code=402, detail="Payment not completed")
+
+    import jwt as _jwt
+    try:
+        payload = _jwt.decode(
+            token,
+            os.getenv("JWT_SECRET_KEY", "super_secret_music_store_jwt_key_2026_khmer_melody_32bytes_long"),
+            algorithms=[os.getenv("JWT_ALGORITHM", "HS256")],
+        )
+    except Exception:
+        raise HTTPException(status_code=403, detail="Invalid or expired download token")
+    if (
+        payload.get("type") not in ("music_download", "invoice")
+        or payload.get("transaction_id") != transaction_id
+        or payload.get("music_id") != payment.music_id
+    ):
+        raise HTTPException(status_code=403, detail="Invalid download token")
+
+    order = None
+    if payment.order_id:
+        order = db.query(OrderInquiry).filter(OrderInquiry.id == payment.order_id).first()
+    settings = db.query(Settings).order_by(Settings.id.asc()).first()
+    store_name = (settings.site_name_en if settings and settings.site_name_en else "KhmerBeats Music Store")
+    reference = (order.reference_code if order else transaction_id[:12])
+    customer = payment.customer_name or (order.customer_name if order else "")
+    contact = payment.customer_phone or ""
+
+    try:
+        from .invoice import make_invoice_pdf
+    except (ImportError, ValueError):
+        from invoice import make_invoice_pdf
+
+    try:
+        pdf_bytes = make_invoice_pdf({
+            "store": store_name,
+            "reference": reference,
+            "transaction_id": payment.transaction_id,
+            "date": payment.paid_at or payment.created_at,
+            "customer": customer or "Guest Buyer",
+            "contact": contact,
+            "music": payment.music_title,
+            "artist": payment.music_artist,
+            "original_price": payment.original_price,
+            "track_discount": payment.track_discount,
+            "promo_code": payment.promo_code,
+            "promo_discount": payment.promo_discount,
+            "total": payment.amount,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not generate invoice: {exc}")
+
+    safe_ref = _safe_download_name(reference) or "invoice"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="invoice-{safe_ref}.pdf"'},
     )
 
 # ==================== FILE UPLOADS (UPLOADTHING CDN) ====================

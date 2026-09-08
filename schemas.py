@@ -207,6 +207,7 @@ class PaymentStatusResponse(BaseModel):
     music_title: Optional[str] = None
     download_token: Optional[str] = None
     download_url: Optional[str] = None
+    invoice_url: Optional[str] = None
     message: Optional[str] = None
 
     class Config:
